@@ -2017,22 +2017,15 @@ const AI_PROVIDERS = [
 ];
 let activeProvider = 0;
 
-// ── Gemini (FREE — 1500 req/day) ───────────────
+// ── Gemini (FREE — 1500 req/day) via Netlify proxy ─
 async function callGemini(prompt, systemPrompt, maxTokens=1800){
   const key = await getAPIKey('gemini');
   if(!key) throw new Error('NO_GEMINI_KEY');
 
-  const models = [
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-latest',
-    'gemini-1.5-pro',
-    'gemini-2.0-flash-lite',
-  ];
+  const models = ['gemini-1.5-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash-latest'];
 
-  const buildContents = (includeSystem) => {
+  const buildContents = () => {
     const msgs = [];
-    if(includeSystem) msgs.push({role:'user', parts:[{text:'[SYSTEM INSTRUCTIONS]: '+systemPrompt}]});
-    if(includeSystem) msgs.push({role:'model', parts:[{text:'Understood. I will follow these instructions.'}]});
     if(chatHistory.length > 1){
       chatHistory.slice(-8).forEach(m=>{
         msgs.push({ role: m.role==='assistant'?'model':'user', parts:[{text:m.content}] });
@@ -2045,41 +2038,40 @@ async function callGemini(prompt, systemPrompt, maxTokens=1800){
     return msgs;
   };
 
+  // Use our Netlify proxy — no CORS issues
+  const PROXY = '/api/gemini';
+
   let lastErr = null;
   for(const model of models){
     try{
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-      const body = {
-        contents: buildContents(false),
-        system_instruction: { parts:[{text: systemPrompt}] },
-        generationConfig:{ maxOutputTokens: maxTokens, temperature: 0.7 }
-      };
-      const r = await fetch(url, {
+      const r = await fetch(PROXY, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify({
+          key,
+          model,
+          contents: buildContents(),
+          system_instruction: { parts:[{text: systemPrompt}] },
+          generationConfig:{ maxOutputTokens: maxTokens, temperature: 0.7 }
+        })
       });
 
-      if(!r.ok){
-        const errJson = await r.json().catch(()=>({}));
-        const msg = errJson?.error?.message || `HTTP ${r.status}`;
-        if(r.status===400 && (msg.includes('API_KEY')||msg.includes('invalid'))) throw new Error('INVALID_GEMINI_KEY');
-        if(r.status===403) throw new Error('INVALID_GEMINI_KEY');
-        if(r.status===404||r.status===400){ lastErr=new Error(msg); continue; }
-        if(r.status===429){ throw new Error('RESOURCE_EXHAUSTED'); }
-        lastErr=new Error(msg); continue;
-      }
+      const d = await r.json().catch(()=>null);
+      const errMsg   = d?.error?.message || '';
+      const errStatus= d?.error?.status  || '';
 
-      const d = await r.json();
-      if(d.error){
-        const msg = d.error.message||'Gemini error';
-        if(msg.includes('API_KEY')||msg.includes('invalid')) throw new Error('INVALID_GEMINI_KEY');
-        if(msg.includes('RESOURCE_EXHAUSTED')||msg.includes('quota')) throw new Error('RESOURCE_EXHAUSTED');
-        lastErr=new Error(msg); continue;
-      }
+      if(r.status===401||r.status===403||(r.status===400&&errMsg.toLowerCase().includes('api key')))
+        throw new Error('INVALID_GEMINI_KEY');
+      if(r.status===429||errStatus==='RESOURCE_EXHAUSTED')
+        throw new Error('RESOURCE_EXHAUSTED');
+      if(r.status===404||r.status===400){ lastErr=new Error(errMsg||`HTTP ${r.status}`); continue; }
+      if(!r.ok){ lastErr=new Error(errMsg||`HTTP ${r.status}`); continue; }
 
-      const text = d.candidates?.[0]?.content?.parts?.[0]?.text;
+      const text = d?.candidates?.[0]?.content?.parts?.[0]?.text;
       if(text) return text;
+
+      const blockReason = d?.candidates?.[0]?.finishReason;
+      if(blockReason && blockReason!=='STOP'){ lastErr=new Error(`Blocked: ${blockReason}`); continue; }
       lastErr=new Error('Empty response'); continue;
 
     }catch(e){
@@ -2087,7 +2079,7 @@ async function callGemini(prompt, systemPrompt, maxTokens=1800){
       lastErr=e; continue;
     }
   }
-  throw lastErr || new Error('All Gemini models failed');
+  throw lastErr || new Error('Gemini unavailable');
 }
 
 // ── Claude Sonnet ───────────────────────────────
@@ -2118,30 +2110,35 @@ async function callClaude(prompt, systemPrompt, maxTokens=1800){
 async function callAIProvider(prompt, maxTokens=1800){
   const sys = buildSys();
   const gemKey = await getAPIKey('gemini');
+  const clKey  = await getAPIKey('claude');
+
+  if(!gemKey && !clKey) throw new Error('NO_KEY');
+
+  // Try Gemini first
   if(gemKey){
     try{
       const txt = await callGemini(prompt, sys, maxTokens);
-      if(txt){ activeProvider=0; return txt; }
+      if(txt){ activeProvider=0; updateAIBadge(); return txt; }
     }catch(e){
-      if(e.message==='INVALID_GEMINI_KEY'){
-        console.warn('Gemini: invalid key');
-        // fall through to Claude
-      } else if(e.message!=='NO_GEMINI_KEY'){
-        console.warn('Gemini failed:', e.message);
-        // fall through to Claude
-      }
+      // Fatal errors — don't fallback, surface to user
+      if(e.message==='INVALID_GEMINI_KEY') throw e;
+      if(e.message==='RESOURCE_EXHAUSTED' && !clKey) throw e;
+      // Otherwise log and try Claude
+      console.warn('Gemini failed, trying Claude:', e.message);
     }
   }
-  const clKey = await getAPIKey('claude');
+
+  // Try Claude
   if(clKey){
     try{
       const txt = await callClaude(prompt, sys, maxTokens);
-      if(txt){ activeProvider=1; return txt; }
+      if(txt){ activeProvider=1; updateAIBadge(); return txt; }
     }catch(e){
-      if(e.message!=='NO_CLAUDE_KEY') console.warn('Claude failed:', e.message);
+      if(e.message==='NO_CLAUDE_KEY') { /* skip */ }
+      else throw e;
     }
   }
-  if(!gemKey && !clKey) throw new Error('NO_KEY');
+
   throw new Error('AI_FAILED');
 }
 
@@ -2376,35 +2373,67 @@ function quickQ(q){
 async function askAISilent(q){
   try{
     const txt = await callAIProvider(q, 100);
-    if(txt) document.getElementById('dtip').textContent=txt;
-  }catch(e){ /* silent — not critical */ }
+    if(txt){
+      const el=document.getElementById('dtip');
+      if(el) el.textContent=txt;
+    }
+  }catch(e){
+    console.warn('askAISilent failed:', e.message);
+  }
 }
 
 async function generateDailyTip(){
   const el=document.getElementById('dtip');
-  if(!user) return;
+  if(!user||!el) return;
+  el.textContent='⏳ Loading your tip…';
   try{
     const goalObj=GOALS.find(g=>g.id===user.goal)||GOALS[0];
     const prompt=`Give one personalized fitness tip for: ${user.name}, ${user.age}yo ${user.gender}, ${user.diet}, ${user.activity} activity, goal: ${goalObj.emoji} ${goalObj.label}, ${user.weight}kg→${user.targetWeight}kg. 2 sentences max, no markdown headers, just plain encouraging text with 1 relevant emoji.`;
-    const txt = await callAIProvider(prompt, 120);
-    el.textContent = txt || getOfflineTip();
-  }catch(e){ el.textContent=getOfflineTip(); }
+    const txt = await callAIProvider(prompt, 150);
+    if(txt && txt.trim()){
+      el.textContent = txt.trim();
+    } else {
+      el.textContent = getOfflineTip();
+    }
+  }catch(e){
+    console.warn('Daily tip failed:', e.message);
+    // Show the real error so user knows what's happening
+    if(e.message==='NO_KEY'){
+      el.textContent = '🔑 Add a free API key (Gemini or Claude) in Profile to get personalized AI tips!';
+    } else if(e.message==='INVALID_GEMINI_KEY'){
+      el.textContent = '❌ Your Gemini API key is invalid. Go to Profile → Update API Key.';
+    } else if(e.message==='RESOURCE_EXHAUSTED'){
+      el.textContent = '⏳ Daily AI quota reached. Resets at midnight. Try again later!';
+    } else if(e.message==='AI_FAILED' || e.message?.includes('fetch')){
+      el.textContent = '⚠️ Could not connect to AI. Check your internet & make sure app is opened from the Netlify URL.';
+    } else {
+      el.textContent = `⚠️ AI Error: ${e.message}`;
+    }
+  }
 }
 
 async function refreshDailyTip(){
-  document.getElementById('dtip').textContent='Loading fresh tip…';
+  document.getElementById('dtip').textContent='🔄 Loading fresh tip…';
   generateDailyTip();
 }
 
 function getOfflineTip(){
+  // Use time-based seed so it's different every time
   const tips=[
-    `Add ${user?.diet==='Non-Vegetarian'?'eggs or chicken':'soya chunks or paneer'} to hit your protein target today! 💪`,
-    'Start your morning with moong dal sprouts — high protein and easy to digest! 🌱',
-    'Drink 500ml water before each meal to control hunger naturally. 💧',
-    'Try Surya Namaskar (12 rounds) for a quick 150 kcal burn at home! 🧘',
-    'Dal + roti is a complete protein combo — perfect post-workout meal! 🍛'
+    `💪 Mix dal + rice for a complete protein meal — perfect for ${user?.goal==='weight_gain'?'bulking':'recovery'}!`,
+    '🌱 Moong dal sprouts for breakfast = high protein, easy digestion, great energy.',
+    '💧 Drink 500ml water 30 min before each meal — reduces hunger naturally.',
+    '🧘 20 min yoga or walk after dinner speeds up fat burning overnight.',
+    '🥜 Handful of peanuts = 8g protein, healthy fats, perfect snack.',
+    '🍛 Paneer + roti = complete amino acid profile. Eat it for lunch.',
+    '⏰ Eating within 30 min of waking boosts metabolism all day.',
+    '🥗 Add jeera (cumin) to dal — improves digestion and absorption.',
+    '💤 7-8 hours sleep is when your body burns fat and builds muscle.',
+    '🏃 Even a 15-min brisk walk after meals burns 80-100 extra kcal.',
   ];
-  return tips[Math.floor(Math.random()*tips.length)];
+  // Different tip based on minute of day — never the same twice in a row
+  const idx = Math.floor(Date.now()/60000) % tips.length;
+  return tips[idx];
 }
 
 function renderAIIns(){
