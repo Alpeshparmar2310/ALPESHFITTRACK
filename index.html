@@ -2017,12 +2017,16 @@ const AI_PROVIDERS = [
 ];
 let activeProvider = 0;
 
-// ── Gemini (FREE — 1500 req/day) via Netlify proxy ─
+// ── Gemini (FREE — 1500 req/day) direct call ───
 async function callGemini(prompt, systemPrompt, maxTokens=1800){
   const key = await getAPIKey('gemini');
   if(!key) throw new Error('NO_GEMINI_KEY');
 
-  const models = ['gemini-1.5-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash-latest'];
+  const models = [
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-8b',
+    'gemini-1.5-pro',
+  ];
 
   const buildContents = () => {
     const msgs = [];
@@ -2038,33 +2042,32 @@ async function callGemini(prompt, systemPrompt, maxTokens=1800){
     return msgs;
   };
 
-  // Use our Netlify proxy — no CORS issues
-  const PROXY = '/api/gemini';
-
   let lastErr = null;
   for(const model of models){
     try{
-      const r = await fetch(PROXY, {
+      // Use v1 (not v1beta) — has proper CORS headers for browser access
+      const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${key}`;
+
+      const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          key,
-          model,
           contents: buildContents(),
-          system_instruction: { parts:[{text: systemPrompt}] },
+          systemInstruction: { parts:[{text: systemPrompt}] },
           generationConfig:{ maxOutputTokens: maxTokens, temperature: 0.7 }
         })
       });
 
       const d = await r.json().catch(()=>null);
-      const errMsg   = d?.error?.message || '';
-      const errStatus= d?.error?.status  || '';
+      const errMsg    = d?.error?.message || '';
+      const errStatus = d?.error?.status  || '';
 
       if(r.status===401||r.status===403||(r.status===400&&errMsg.toLowerCase().includes('api key')))
         throw new Error('INVALID_GEMINI_KEY');
       if(r.status===429||errStatus==='RESOURCE_EXHAUSTED')
         throw new Error('RESOURCE_EXHAUSTED');
-      if(r.status===404||r.status===400){ lastErr=new Error(errMsg||`HTTP ${r.status}`); continue; }
+      if(r.status===404){ lastErr=new Error(`Model ${model} not found`); continue; }
+      if(r.status===400){ lastErr=new Error(errMsg||'Bad request'); continue; }
       if(!r.ok){ lastErr=new Error(errMsg||`HTTP ${r.status}`); continue; }
 
       const text = d?.candidates?.[0]?.content?.parts?.[0]?.text;
